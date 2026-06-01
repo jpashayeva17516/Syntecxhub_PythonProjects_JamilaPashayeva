@@ -1,0 +1,210 @@
+import json
+import os
+from datetime import datetime
+
+# ──────────────────────────────────────────
+#  FILE STORAGE
+# ──────────────────────────────────────────
+TASKS_FILE = "tasks.json"
+
+def load_tasks():
+    """Load tasks from JSON file. Returns empty list if file doesn't exist."""
+    if not os.path.exists(TASKS_FILE):
+        return []
+    try:
+        with open(TASKS_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        print("  ⚠  Could not read tasks file. Starting fresh.")
+        return []
+
+def save_tasks(tasks):
+    """Save tasks list to JSON file."""
+    try:
+        with open(TASKS_FILE, "w") as f:
+            json.dump(tasks, f, indent=4)
+    except IOError:
+        print("  ⚠  Could not save tasks. Check file permissions.")
+
+
+# ──────────────────────────────────────────
+#  TASK OPERATIONS (Logic Layer)
+# ──────────────────────────────────────────
+def add_task(tasks, title, tag="", due_date=""):
+    """Add a new task to the list."""
+    task = {
+        "id": len(tasks) + 1,
+        "title": title,
+        "tag": tag.strip().lower() if tag else "general",
+        "due_date": due_date.strip() if due_date else "No due date",
+        "done": False,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    print(f"\n  ✅  Task added: \"{title}\"")
+
+
+def view_tasks(tasks, filter_done=None):
+    """Display tasks. filter_done=None shows all, True=done, False=pending."""
+    if not tasks:
+        print("\n  📭  No tasks found.")
+        return
+
+    print("\n" + "─" * 52)
+    print(f"  {'ID':<4} {'Title':<22} {'Tag':<10} {'Due':<12} {'Status'}")
+    print("─" * 52)
+
+    shown = 0
+    for t in tasks:
+        if filter_done is not None and t["done"] != filter_done:
+            continue
+        status = "✅ Done" if t["done"] else "🕐 Pending"
+        due = t.get("due_date", "No due date")
+        tag = t.get("tag", "general")
+        print(f"  {t['id']:<4} {t['title']:<22} {tag:<10} {due:<12} {status}")
+        shown += 1
+
+    print("─" * 52)
+    if shown == 0:
+        print("  No tasks match this filter.")
+
+
+def mark_done(tasks, task_id):
+    """Mark a task as completed by its ID."""
+    for t in tasks:
+        if t["id"] == task_id:
+            if t["done"]:
+                print(f"\n  ℹ  Task #{task_id} is already marked as done.")
+            else:
+                t["done"] = True
+                save_tasks(tasks)
+                print(f"\n  ✅  Task #{task_id} marked as done: \"{t['title']}\"")
+            return
+    print(f"\n  ⚠  No task found with ID {task_id}.")
+
+
+def delete_task(tasks, task_id):
+    """Delete a task by its ID."""
+    for i, t in enumerate(tasks):
+        if t["id"] == task_id:
+            removed = tasks.pop(i)
+            # Re-number remaining tasks
+            for j, task in enumerate(tasks):
+                task["id"] = j + 1
+            save_tasks(tasks)
+            print(f"\n  🗑  Deleted task: \"{removed['title']}\"")
+            return
+    print(f"\n  ⚠  No task found with ID {task_id}.")
+
+
+def search_tasks(tasks, keyword):
+    """Search tasks by title or tag."""
+    keyword = keyword.lower()
+    results = [t for t in tasks if keyword in t["title"].lower() or keyword in t.get("tag", "").lower()]
+    if not results:
+        print(f"\n  🔍  No tasks found matching \"{keyword}\".")
+    else:
+        print(f"\n  🔍  Search results for \"{keyword}\":")
+        view_tasks(results)
+
+
+# ──────────────────────────────────────────
+#  INPUT HELPERS (IO Layer)
+# ──────────────────────────────────────────
+def get_task_id(prompt):
+    """Prompt for a valid integer task ID."""
+    while True:
+        raw = input(prompt).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            print("  ⚠  Please enter a valid task ID (number).")
+
+
+def print_menu():
+    """Print the main menu."""
+    print("\n┌─────────────────────────────────┐")
+    print("│         📝  To-Do Manager        │")
+    print("├─────────────────────────────────┤")
+    print("│  1. Add Task                    │")
+    print("│  2. View All Tasks              │")
+    print("│  3. View Pending Tasks          │")
+    print("│  4. View Completed Tasks        │")
+    print("│  5. Mark Task as Done           │")
+    print("│  6. Delete Task                 │")
+    print("│  7. Search Tasks                │")
+    print("│  8. Exit                        │")
+    print("└─────────────────────────────────┘")
+
+
+# ──────────────────────────────────────────
+#  MAIN LOOP
+# ──────────────────────────────────────────
+def main():
+    print("\n" + "=" * 42)
+    print("   ✅  Welcome to To-Do List Manager")
+    print("=" * 42)
+
+    tasks = load_tasks()
+    print(f"  📂  Loaded {len(tasks)} task(s) from file.")
+
+    while True:
+        print_menu()
+        choice = input("  Enter your choice (1-8): ").strip()
+
+        if choice == "1":
+            title = input("\n  Task title: ").strip()
+            if not title:
+                print("  ⚠  Title cannot be empty.")
+                continue
+            tag = input("  Tag (e.g. work, study, personal) [optional]: ").strip()
+            due = input("  Due date (e.g. 2025-07-01) [optional]: ").strip()
+            add_task(tasks, title, tag, due)
+
+        elif choice == "2":
+            view_tasks(tasks)
+
+        elif choice == "3":
+            print("\n  🕐  Pending Tasks:")
+            view_tasks(tasks, filter_done=False)
+
+        elif choice == "4":
+            print("\n  ✅  Completed Tasks:")
+            view_tasks(tasks, filter_done=True)
+
+        elif choice == "5":
+            view_tasks(tasks, filter_done=False)
+            task_id = get_task_id("\n  Enter Task ID to mark as done: ")
+            mark_done(tasks, task_id)
+
+        elif choice == "6":
+            view_tasks(tasks)
+            task_id = get_task_id("\n  Enter Task ID to delete: ")
+            confirm = input(f"  Are you sure you want to delete task #{task_id}? (yes/no): ").strip().lower()
+            if confirm in ("yes", "y"):
+                delete_task(tasks, task_id)
+            else:
+                print("  Deletion cancelled.")
+
+        elif choice == "7":
+            keyword = input("\n  Enter keyword to search: ").strip()
+            if keyword:
+                search_tasks(tasks, keyword)
+            else:
+                print("  ⚠  Please enter a keyword.")
+
+        elif choice == "8":
+            print("\n  👋  Goodbye! Your tasks are saved.")
+            print("=" * 42 + "\n")
+            break
+
+        else:
+            print("  ⚠  Invalid choice. Please enter a number between 1 and 8.")
+
+
+# ──────────────────────────────────────────
+#  ENTRY POINT
+# ──────────────────────────────────────────
+if __name__ == "__main__":
+    main()

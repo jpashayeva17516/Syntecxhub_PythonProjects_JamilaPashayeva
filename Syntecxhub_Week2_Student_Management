@@ -1,0 +1,195 @@
+////////////////////////////////////////////////////////////////
+# main.py file
+////////////////////////////////////////////////////////////////
+
+from manager import StudentManager
+
+def print_menu():
+    print("\n" + "=" * 35)
+    print("   🎓 Student Management System")
+    print("=" * 35)
+    print("  1. Add Student")
+    print("  2. Update Student")
+    print("  3. Delete Student")
+    print("  4. List All Students")
+    print("  5. Search Student by ID")
+    print("  6. Exit")
+    print("=" * 35)
+
+def main():
+    manager = StudentManager()
+
+    while True:
+        print_menu()
+        choice = input("Enter your choice (1-6): ").strip()
+
+        if choice == "1":
+            print("\n-- Add New Student --")
+            sid   = input("Enter Student ID   : ").strip()
+            name  = input("Enter Student Name : ").strip()
+            grade = input("Enter Grade        : ").strip()
+            manager.add_student(sid, name, grade)
+
+        elif choice == "2":
+            print("\n-- Update Student --")
+            sid   = input("Enter Student ID to update : ").strip()
+            name  = input("New Name  (press Enter to skip): ").strip()
+            grade = input("New Grade (press Enter to skip): ").strip()
+            manager.update_student(sid, name or None, grade or None)
+
+        elif choice == "3":
+            print("\n-- Delete Student --")
+            sid = input("Enter Student ID to delete : ").strip()
+            confirm = input(f"Are you sure you want to delete '{sid}'? (yes/no): ").strip().lower()
+            if confirm == "yes":
+                manager.delete_student(sid)
+            else:
+                print("❎ Deletion cancelled.")
+
+        elif choice == "4":
+            manager.list_students()
+
+        elif choice == "5":
+            print("\n-- Search Student --")
+            sid = input("Enter Student ID to search : ").strip()
+            manager.search_student(sid)
+
+        elif choice == "6":
+            print("\n👋 Goodbye!")
+            break
+
+        else:
+            print("\n⚠️  Invalid choice. Please enter a number between 1 and 6.")
+
+if __name__ == "__main__":
+    main()
+
+//////////////////////////////////////////////////////////////////////////////////////////
+Manager.py file
+//////////////////////////////////////////////////////////////////////////////////////////
+
+# manager.py
+
+import json
+import os
+from student import Student
+
+FILE_PATH = "students.json"
+
+class StudentManager:
+    def __init__(self):
+        self.students = {}  # key: student_id, value: Student object
+        self.load_from_file()
+
+    # ---------- File I/O ----------
+
+    def load_from_file(self):
+        """Load students from JSON file on startup."""
+        if os.path.exists(FILE_PATH):
+            with open(FILE_PATH, "r") as f:
+                data = json.load(f)
+                for record in data:
+                    s = Student.from_dict(record)
+                    self.students[s.student_id] = s
+        else:
+            self.students = {}
+
+    def save_to_file(self):
+        """Save all students to JSON file."""
+        with open(FILE_PATH, "w") as f:
+            json.dump([s.to_dict() for s in self.students.values()], f, indent=4)
+
+    # ---------- CRUD Operations ----------
+
+    def add_student(self, student_id, name, grade):
+        """Add a new student with unique ID validation."""
+        if student_id in self.students:
+            print(f"\n❌ Error: Student ID '{student_id}' already exists!")
+            return False
+        if not student_id or not name or not grade:
+            print("\n❌ Error: All fields (ID, name, grade) are required!")
+            return False
+
+        self.students[student_id] = Student(student_id, name, grade)
+        self.save_to_file()
+        print(f"\n✅ Student '{name}' added successfully!")
+        return True
+
+    def update_student(self, student_id, name=None, grade=None):
+        """Update name and/or grade of an existing student."""
+        if student_id not in self.students:
+            print(f"\n❌ Error: Student ID '{student_id}' not found!")
+            return False
+
+        student = self.students[student_id]
+        if name:
+            student.name = name
+        if grade:
+            student.grade = grade
+
+        self.save_to_file()
+        print(f"\n✅ Student '{student_id}' updated successfully!")
+        return True
+
+    def delete_student(self, student_id):
+        """Delete a student by ID."""
+        if student_id not in self.students:
+            print(f"\n❌ Error: Student ID '{student_id}' not found!")
+            return False
+
+        name = self.students[student_id].name
+        del self.students[student_id]
+        self.save_to_file()
+        print(f"\n✅ Student '{name}' deleted successfully!")
+        return True
+
+    def list_students(self):
+        """Print all students in a formatted table."""
+        if not self.students:
+            print("\n⚠️  No students found.")
+            return
+
+        print("\n" + "=" * 45)
+        print(f"| {'ID':<10} | {'Name':<20} | {'Grade':<5} |")
+        print("=" * 45)
+        for student in self.students.values():
+            print(student)
+        print("=" * 45)
+        print(f"  Total students: {len(self.students)}")
+
+    def search_student(self, student_id):
+        """Search for a student by ID."""
+        if student_id in self.students:
+            print("\n" + "=" * 45)
+            print(f"| {'ID':<10} | {'Name':<20} | {'Grade':<5} |")
+            print("=" * 45)
+            print(self.students[student_id])
+            print("=" * 45)
+        else:
+            print(f"\n❌ Student ID '{student_id}' not found!")
+
+//////////////////////////////////////////////////////////////////////////////////
+# student.py
+/////////////////////////////////////////////////////////////////////////////////
+
+class Student:
+    def __init__(self, student_id, name, grade):
+        self.student_id = student_id
+        self.name = name
+        self.grade = grade
+
+    def to_dict(self):
+        """Convert student object to dictionary for JSON saving."""
+        return {
+            "student_id": self.student_id,
+            "name": self.name,
+            "grade": self.grade
+        }
+
+    @staticmethod
+    def from_dict(data):
+        """Create a Student object from a dictionary (for loading from JSON)."""
+        return Student(data["student_id"], data["name"], data["grade"])
+
+    def __str__(self):
+        return f"| {self.student_id:<10} | {self.name:<20} | {self.grade:<5} |"

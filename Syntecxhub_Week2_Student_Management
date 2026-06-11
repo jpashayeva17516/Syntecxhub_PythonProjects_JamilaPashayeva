@@ -1,3 +1,10 @@
+Syntecxhub_Student_Management
+│
+├── student.py          # Student class
+├── manager.py          # StudentManager class
+├── main.py             # CLI entry point
+└── students.json       # Auto-created data file
+
 ////////////////////////////////////////////////////////////////
 # main.py file
 ////////////////////////////////////////////////////////////////

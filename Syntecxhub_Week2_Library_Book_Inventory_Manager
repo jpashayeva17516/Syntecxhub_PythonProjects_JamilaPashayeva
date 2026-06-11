@@ -1,0 +1,271 @@
+Syntecxhub_Library_Inventory/
+│
+├── book.py          # Book class
+├── library.py       # Library class (all operations)
+├── main.py          # CLI entry point
+└── library.json     # Auto-created data file
+
+/////////////////////////////////////////////////////////////
+book.py file
+/////////////////////////////////////////////////////////////
+
+# book.py
+
+class Book:
+    def __init__(self, book_id, title, author, is_issued=False, issued_to=None):
+        self.book_id   = book_id
+        self.title     = title
+        self.author    = author
+        self.is_issued = is_issued      # True if currently borrowed
+        self.issued_to = issued_to      # Name of borrower
+
+    def to_dict(self):
+        """Convert Book object to dictionary for JSON saving."""
+        return {
+            "book_id":   self.book_id,
+            "title":     self.title,
+            "author":    self.author,
+            "is_issued": self.is_issued,
+            "issued_to": self.issued_to
+        }
+
+    @staticmethod
+    def from_dict(data):
+        """Create a Book object from a dictionary (loading from JSON)."""
+        return Book(
+            data["book_id"],
+            data["title"],
+            data["author"],
+            data.get("is_issued", False),
+            data.get("issued_to", None)
+        )
+
+    def __str__(self):
+        status = f"Issued to: {self.issued_to}" if self.is_issued else "Available"
+        return (f"| {self.book_id:<8} | {self.title:<25} | "
+                f"{self.author:<20} | {status:<20} |")
+
+//////////////////////////////////////////////////////////////////////////////////////////
+library.py file
+//////////////////////////////////////////////////////////////////////////////////////////
+
+# library.py
+
+import json
+import os
+from book import Book
+
+FILE_PATH = "library.json"
+
+class Library:
+    def __init__(self):
+        self.books = {}   # key: book_id, value: Book object
+        self.load_from_file()
+
+    # ---------- File I/O ----------
+
+    def load_from_file(self):
+        """Load books from JSON file on startup."""
+        if os.path.exists(FILE_PATH):
+            with open(FILE_PATH, "r") as f:
+                data = json.load(f)
+                for record in data:
+                    b = Book.from_dict(record)
+                    self.books[b.book_id] = b
+        else:
+            self.books = {}
+
+    def save_to_file(self):
+        """Save all books to JSON file."""
+        with open(FILE_PATH, "w") as f:
+            json.dump([b.to_dict() for b in self.books.values()], f, indent=4)
+
+    # ---------- Add ----------
+
+    def add_book(self, book_id, title, author):
+        """Add a new book with unique ID validation."""
+        if not book_id or not title or not author:
+            print("\n❌ Error: All fields (ID, title, author) are required!")
+            return False
+        if book_id in self.books:
+            print(f"\n❌ Error: Book ID '{book_id}' already exists!")
+            return False
+
+        self.books[book_id] = Book(book_id, title, author)
+        self.save_to_file()
+        print(f"\n✅ Book '{title}' added successfully!")
+        return True
+
+    # ---------- Search ----------
+
+    def search_by_title(self, keyword):
+        """Search books by title keyword (case-insensitive)."""
+        keyword = keyword.lower()
+        results = [b for b in self.books.values()
+                   if keyword in b.title.lower()]
+        self._print_results(results, f"title containing '{keyword}'")
+
+    def search_by_author(self, keyword):
+        """Search books by author keyword (case-insensitive)."""
+        keyword = keyword.lower()
+        results = [b for b in self.books.values()
+                   if keyword in b.author.lower()]
+        self._print_results(results, f"author containing '{keyword}'")
+
+    def _print_results(self, results, label):
+        """Helper to print search results in a formatted table."""
+        if not results:
+            print(f"\n⚠️  No books found with {label}.")
+            return
+        self._print_table(results)
+
+    # ---------- Issue / Return ----------
+
+    def issue_book(self, book_id, borrower_name):
+        """Issue a book to a borrower."""
+        if book_id not in self.books:
+            print(f"\n❌ Error: Book ID '{book_id}' not found!")
+            return False
+
+        book = self.books[book_id]
+        if book.is_issued:
+            print(f"\n❌ '{book.title}' is already issued to {book.issued_to}!")
+            return False
+
+        book.is_issued = True
+        book.issued_to = borrower_name
+        self.save_to_file()
+        print(f"\n✅ '{book.title}' issued to {borrower_name} successfully!")
+        return True
+
+    def return_book(self, book_id):
+        """Return a previously issued book."""
+        if book_id not in self.books:
+            print(f"\n❌ Error: Book ID '{book_id}' not found!")
+            return False
+
+        book = self.books[book_id]
+        if not book.is_issued:
+            print(f"\n⚠️  '{book.title}' was not issued to anyone!")
+            return False
+
+        borrower = book.issued_to
+        book.is_issued = False
+        book.issued_to = None
+        self.save_to_file()
+        print(f"\n✅ '{book.title}' returned by {borrower} successfully!")
+        return True
+
+    # ---------- List / Reports ----------
+
+    def list_all_books(self):
+        """Display all books in a formatted table."""
+        if not self.books:
+            print("\n⚠️  No books in the library.")
+            return
+        self._print_table(list(self.books.values()))
+
+    def show_report(self):
+        """Show a simple summary report."""
+        total    = len(self.books)
+        issued   = sum(1 for b in self.books.values() if b.is_issued)
+        available = total - issued
+
+        print("\n" + "=" * 40)
+        print("       📊 Library Report")
+        print("=" * 40)
+        print(f"  Total Books    : {total}")
+        print(f"  Available      : {available}")
+        print(f"  Issued Out     : {issued}")
+        print("=" * 40)
+
+        if issued > 0:
+            print("\n  Currently Issued Books:")
+            print("-" * 40)
+            for book in self.books.values():
+                if book.is_issued:
+                    print(f"  [{book.book_id}] '{book.title}' → {book.issued_to}")
+            print("-" * 40)
+
+    # ---------- Helper ----------
+
+    def _print_table(self, books):
+        """Print a formatted table of books."""
+        print("\n" + "=" * 85)
+        print(f"| {'ID':<8} | {'Title':<25} | {'Author':<20} | {'Status':<20} |")
+        print("=" * 85)
+        for book in books:
+            print(book)
+        print("=" * 85)
+        print(f"  Showing {len(books)} book(s).")
+
+////////////////////////////////////////////////////////////////////////////////////
+# main.py
+///////////////////////////////////////////////////////////////////////////////////
+
+from library import Library
+
+def print_menu():
+    print("\n" + "=" * 38)
+    print("   📚 Library Book Inventory Manager")
+    print("=" * 38)
+    print("  1. Add Book")
+    print("  2. Search by Title")
+    print("  3. Search by Author")
+    print("  4. Issue Book")
+    print("  5. Return Book")
+    print("  6. List All Books")
+    print("  7. Show Report")
+    print("  8. Exit")
+    print("=" * 38)
+
+def main():
+    library = Library()
+
+    while True:
+        print_menu()
+        choice = input("Enter your choice (1-8): ").strip()
+
+        if choice == "1":
+            print("\n-- Add New Book --")
+            bid    = input("Enter Book ID  : ").strip()
+            title  = input("Enter Title    : ").strip()
+            author = input("Enter Author   : ").strip()
+            library.add_book(bid, title, author)
+
+        elif choice == "2":
+            print("\n-- Search by Title --")
+            keyword = input("Enter title keyword: ").strip()
+            library.search_by_title(keyword)
+
+        elif choice == "3":
+            print("\n-- Search by Author --")
+            keyword = input("Enter author keyword: ").strip()
+            library.search_by_author(keyword)
+
+        elif choice == "4":
+            print("\n-- Issue Book --")
+            bid      = input("Enter Book ID       : ").strip()
+            borrower = input("Enter Borrower Name : ").strip()
+            library.issue_book(bid, borrower)
+
+        elif choice == "5":
+            print("\n-- Return Book --")
+            bid = input("Enter Book ID to return: ").strip()
+            library.return_book(bid)
+
+        elif choice == "6":
+            library.list_all_books()
+
+        elif choice == "7":
+            library.show_report()
+
+        elif choice == "8":
+            print("\n👋 Goodbye!")
+            break
+
+        else:
+            print("\n⚠️  Invalid choice. Please enter a number between 1 and 8.")
+
+if __name__ == "__main__":
+    main()

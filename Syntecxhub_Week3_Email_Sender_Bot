@@ -1,0 +1,393 @@
+Syntecxhub_Email_Sender_Bot/
+│
+├── email_bot.py          ← main script
+├── recipients.csv        ← list of recipients
+├── attachments/          ← put files to attach here
+└── logs/                 ← auto-created log files
+
+/////////////////////////////////////////////////////////
+recipients.csv
+/////////////////////////////////////////////////////////
+name,email,subject,body
+Alice Smith,alice@example.com,Monthly Report,Hi Alice! Please find your monthly report attached.
+Bob Jones,bob@example.com,Weekly Update,Hello Bob! Here is your weekly update report.
+Charlie Brown,charlie@example.com,Newsletter,Hey Charlie! Check out this month's newsletter.
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+email_bot.py
+//////////////////////////////////////////////////////////////////////////////////////////////////
+"""
+Email Sender Bot
+Syntecxhub Internship - Task 3, Project 3
+"""
+
+import argparse
+import csv
+import logging
+import os
+import sys
+import time
+import smtplib
+from datetime import datetime
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import pandas as pd
+
+
+# ─────────────────────────────────────────────
+#  LOGGING SETUP
+# ─────────────────────────────────────────────
+
+def setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    log_filename = f"logs/emailbot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info(f"Logging started → {log_filename}")
+
+
+# ─────────────────────────────────────────────
+#  ARGUMENT PARSER
+# ─────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Send personalized bulk emails with optional attachments."
+    )
+    parser.add_argument(
+        "--sender",
+        required=True,
+        help="Your Gmail address (e.g. you@gmail.com)"
+    )
+    parser.add_argument(
+        "--password",
+        required=True,
+        help="Your Gmail App Password (16 characters, no spaces)"
+    )
+    parser.add_argument(
+        "--recipients",
+        default="recipients.csv",
+        help="Path to the CSV file with recipient list (default: recipients.csv)"
+    )
+    parser.add_argument(
+        "--attachments",
+        nargs="*",
+        default=[],
+        help="File paths to attach to every email (e.g. --attachments report.pdf data.xlsx)"
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        help="Delay in seconds between emails to avoid spam filters (default: 2.0)"
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts if sending fails (default: 3)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate sending without actually sending any emails"
+    )
+    return parser.parse_args()
+
+
+# ─────────────────────────────────────────────
+#  READ RECIPIENTS
+# ─────────────────────────────────────────────
+
+def read_recipients(filepath):
+    """Read recipients from CSV file."""
+    if not os.path.exists(filepath):
+        logging.error(f"Recipients file not found: '{filepath}'")
+        sys.exit(1)
+
+    try:
+        df = pd.read_csv(filepath)
+        required_cols = {"name", "email", "subject", "body"}
+        missing = required_cols - set(df.columns.str.lower())
+        if missing:
+            logging.error(f"CSV is missing required columns: {missing}")
+            sys.exit(1)
+
+        df.columns = df.columns.str.lower()
+        df = df.dropna(subset=["email"])
+        df = df[df["email"].str.contains("@", na=False)]  # basic email check
+
+        logging.info(f"Loaded {len(df)} valid recipients from '{filepath}'.")
+        return df.to_dict(orient="records")
+
+    except Exception as e:
+        logging.error(f"Failed to read recipients CSV: {e}")
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────
+#  BUILD EMAIL
+# ─────────────────────────────────────────────
+
+def build_email(sender, recipient, subject, body, attachments):
+    """Build a MIME email with optional attachments."""
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+
+    # Email body
+    msg.attach(MIMEText(body, "plain"))
+
+    # Attach files
+    for filepath in attachments:
+        if not os.path.exists(filepath):
+            logging.warning(f"Attachment not found, skipping: '{filepath}'")
+            continue
+        try:
+            with open(filepath, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            filename = os.path.basename(filepath)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={filename}"
+            )
+            msg.attach(part)
+            logging.info(f"Attached file: '{filename}'")
+        except Exception as e:
+            logging.warning(f"Could not attach '{filepath}': {e}")
+
+    return msg
+
+
+# ─────────────────────────────────────────────
+#  SEND EMAIL WITH RETRY
+# ─────────────────────────────────────────────
+
+def send_email_with_retry(server, sender, recipient_email, msg, retries=3, delay=2.0):
+    """Try sending an email up to `retries` times."""
+    for attempt in range(1, retries + 1):
+        try:
+            server.sendmail(sender, recipient_email, msg.as_string())
+            logging.info(f"✓ Sent to {recipient_email} (attempt {attempt})")
+            return True
+        except smtplib.SMTPRecipientsRefused:
+            logging.error(f"✗ Recipient refused: {recipient_email}. Skipping.")
+            return False
+        except smtplib.SMTPException as e:
+            logging.warning(f"Attempt {attempt} failed for {recipient_email}: {e}")
+            if attempt < retries:
+                logging.info(f"Retrying in {delay * attempt:.1f}s...")
+                time.sleep(delay * attempt)
+            else:
+                logging.error(f"✗ All {retries} attempts failed for {recipient_email}.")
+                return False
+    return False
+
+
+# ─────────────────────────────────────────────
+#  SEND REPORT
+# ─────────────────────────────────────────────
+
+def save_send_report(results):
+    """Save a CSV report of send statuses."""
+    os.makedirs("logs", exist_ok=True)
+    report_path = f"logs/send_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(report_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "email", "status", "timestamp"])
+        writer.writeheader()
+        writer.writerows(results)
+    logging.info(f"Send report saved → {report_path}")
+
+
+# ─────────────────────────────────────────────
+#  CONNECT TO GMAIL SMTP
+# ─────────────────────────────────────────────
+
+def connect_smtp(sender, password):
+    """Connect and login to Gmail SMTP server."""
+    try:
+        logging.info("Connecting to Gmail SMTP server...")
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()  # Encrypt connection
+        server.ehlo()
+        server.login(sender, password)
+        logging.info("Successfully logged in to Gmail SMTP.")
+        return server
+    except smtplib.SMTPAuthenticationError:
+        logging.error(
+            "Authentication failed! Check your Gmail address and App Password.\n"
+            "Make sure you're using an App Password, not your regular Gmail password."
+        )
+        sys.exit(1)
+    except smtplib.SMTPConnectError:
+        logging.error("Could not connect to Gmail SMTP. Check your internet connection.")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"SMTP connection error: {e}")
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────
+#  DISPLAY SUMMARY
+# ─────────────────────────────────────────────
+
+def display_summary(results):
+    sent = sum(1 for r in results if r["status"] == "SENT")
+    failed = sum(1 for r in results if r["status"] == "FAILED")
+    skipped = sum(1 for r in results if r["status"] == "SKIPPED (DRY RUN)")
+
+    print("\n" + "=" * 50)
+    print("           EMAIL SEND SUMMARY")
+    print("=" * 50)
+    print(f"  Total Recipients : {len(results)}")
+    print(f"  ✓ Sent           : {sent}")
+    print(f"  ✗ Failed         : {failed}")
+    if skipped:
+        print(f"  ~ Dry Run        : {skipped}")
+    print("=" * 50 + "\n")
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    setup_logging()
+    args = parse_args()
+
+    logging.info("=== Email Sender Bot Started ===")
+
+    if args.dry_run:
+        logging.info("*** DRY RUN MODE — No emails will actually be sent ***")
+
+    # Read recipients
+    recipients = read_recipients(args.recipients)
+
+    # Connect to SMTP (skip in dry run)
+    server = None
+    if not args.dry_run:
+        server = connect_smtp(args.sender, args.password)
+
+    results = []
+
+    try:
+        for i, recipient in enumerate(recipients, start=1):
+            name = str(recipient.get("name", "")).strip()
+            email = str(recipient.get("email", "")).strip()
+            subject = str(recipient.get("subject", "No Subject")).strip()
+            body = str(recipient.get("body", "")).strip()
+
+            logging.info(f"[{i}/{len(recipients)}] Preparing email for {name} <{email}>")
+
+            # Build personalized email
+            msg = build_email(
+                sender=args.sender,
+                recipient=email,
+                subject=subject,
+                body=body,
+                attachments=args.attachments
+            )
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if args.dry_run:
+                logging.info(f"[DRY RUN] Would send to: {name} <{email}> | Subject: {subject}")
+                results.append({
+                    "name": name,
+                    "email": email,
+                    "status": "SKIPPED (DRY RUN)",
+                    "timestamp": timestamp
+                })
+            else:
+                success = send_email_with_retry(
+                    server=server,
+                    sender=args.sender,
+                    recipient_email=email,
+                    msg=msg,
+                    retries=args.retries,
+                    delay=args.delay
+                )
+                results.append({
+                    "name": name,
+                    "email": email,
+                    "status": "SENT" if success else "FAILED",
+                    "timestamp": timestamp
+                })
+
+            # Delay between emails
+            if i < len(recipients) and not args.dry_run:
+                logging.info(f"Waiting {args.delay}s before next email...")
+                time.sleep(args.delay)
+
+    finally:
+        if server:
+            server.quit()
+            logging.info("SMTP connection closed.")
+
+    # Save report and show summary
+    save_send_report(results)
+    display_summary(results)
+
+    logging.info("=== Email Sender Bot Finished ===")
+
+
+if __name__ == "__main__":
+    main()
+
+///////////////////////////////////////////////////////////////////////
+Output - running
+///////////////////////////////////////////////////////
+Run the Script
+Dry run first (recommended — no emails sent):
+bashpython email_bot.py --sender you@gmail.com --password yourapppassword --dry-run
+Send real emails:
+bashpython email_bot.py --sender you@gmail.com --password yourapppassword
+With attachments:
+bashpython email_bot.py --sender you@gmail.com --password yourapppassword \
+  --attachments attachments/report.pdf attachments/data.xlsx
+Custom CSV + more retries:
+bashpython email_bot.py --sender you@gmail.com --password yourapppassword \
+  --recipients my_list.csv --retries 5 --delay 3.0
+
+What You'll See
+2025-06-21 [INFO] === Email Sender Bot Started ===
+2025-06-21 [INFO] Loaded 3 valid recipients from 'recipients.csv'.
+2025-06-21 [INFO] Connecting to Gmail SMTP server...
+2025-06-21 [INFO] Successfully logged in to Gmail SMTP.
+2025-06-21 [INFO] [1/3] Preparing email for Alice Smith <alice@example.com>
+2025-06-21 [INFO] ✓ Sent to alice@example.com (attempt 1)
+2025-06-21 [INFO] Waiting 2.0s before next email...
+2025-06-21 [INFO] [2/3] Preparing email for Bob Jones <bob@example.com>
+2025-06-21 [INFO] ✓ Sent to bob@example.com (attempt 1)
+...
+
+==================================================
+           EMAIL SEND SUMMARY
+==================================================
+  Total Recipients : 3
+  ✓ Sent           : 3
+  ✗ Failed         : 0
+==================================================
+
+2025-06-21 [INFO] Send report saved → logs/send_report_20250621_....csv
+2025-06-21 [INFO] === Email Sender Bot Finished ===
+
+Send Report (Auto-saved in logs/)
+csvname,email,status,timestamp
+Alice Smith,alice@example.com,SENT,2025-06-21 10:00:01
+Bob Jones,bob@example.com,SENT,2025-06-21 10:00:04
+Charlie Brown,charlie@example.com,FAILED,2025-06-21 10:00:07

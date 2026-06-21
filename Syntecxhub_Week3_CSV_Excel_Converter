@@ -2,6 +2,7 @@ Syntecxhub_CSV_Excel_Converter/
 │
 ├── csv_to_excel.py       ← main script
 ├── sample_data.csv       ← test CSV file
+|── result-renamed.xlsx   (Outputs)
 └── logs/                 ← auto-created by the script
 
 ///////////////////////////////////////////////////////////

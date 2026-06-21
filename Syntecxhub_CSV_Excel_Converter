@@ -1,0 +1,265 @@
+Syntecxhub_CSV_Excel_Converter/
+│
+├── csv_to_excel.py       ← main script
+├── sample_data.csv       ← test CSV file
+└── logs/                 ← auto-created by the script
+
+///////////////////////////////////////////////////////////
+sample_data.csv
+//////////////////////////////////////////////////////////
+first_name,last_name,email,join_date,salary
+Alice,Smith,alice@example.com,2023-01-15,55000
+Bob,,bob@example.com,2023/03/22,62000
+Charlie,Brown,,15-06-2022,
+,Davis,davis@example.com,2022-11-01,47000
+Eve,Wilson,eve@example.com,bad-date,71000
+
+///////////////////////////////////////////////////////////
+csv_to_excel.py
+//////////////////////////////////////////////////////////
+
+"""
+CSV to Excel Converter
+Syntecxhub Internship - Task 3, Project 1
+"""
+
+import argparse
+import logging
+import os
+import sys
+from datetime import datetime
+
+import pandas as pd
+
+
+# ─────────────────────────────────────────────
+#  LOGGING SETUP
+# ─────────────────────────────────────────────
+
+def setup_logging():
+    """Configure logging to both console and a log file."""
+    os.makedirs("logs", exist_ok=True)
+    log_filename = f"logs/converter_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info(f"Logging started. Log file: {log_filename}")
+
+
+# ─────────────────────────────────────────────
+#  ARGUMENT PARSER
+# ─────────────────────────────────────────────
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Convert a CSV file to a cleaned Excel (.xlsx) file."
+    )
+    parser.add_argument(
+        "-i", "--input",
+        required=True,
+        help="Path to the input CSV file (e.g. sample_data.csv)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="output.xlsx",
+        help="Path for the output Excel file (default: output.xlsx)"
+    )
+    parser.add_argument(
+        "--date-columns",
+        nargs="*",
+        default=[],
+        help="Column names to parse as dates (e.g. --date-columns join_date created_at)"
+    )
+    parser.add_argument(
+        "--rename",
+        nargs="*",
+        default=[],
+        help="Rename columns as old=new pairs (e.g. --rename first_name=First last_name=Last)"
+    )
+    parser.add_argument(
+        "--fill-value",
+        default="N/A",
+        help="Value to fill missing text fields with (default: N/A)"
+    )
+    return parser.parse_args()
+
+
+# ─────────────────────────────────────────────
+#  DATA CLEANING
+# ─────────────────────────────────────────────
+
+def read_csv(filepath):
+    """Read the CSV file and return a DataFrame."""
+    if not os.path.exists(filepath):
+        logging.error(f"File not found: '{filepath}'")
+        sys.exit(1)
+
+    if not filepath.lower().endswith(".csv"):
+        logging.error(f"File does not appear to be a CSV: '{filepath}'")
+        sys.exit(1)
+
+    try:
+        df = pd.read_csv(filepath)
+        logging.info(f"Successfully read '{filepath}' — {len(df)} rows, {len(df.columns)} columns.")
+        return df
+    except Exception as e:
+        logging.error(f"Failed to read CSV: {e}")
+        sys.exit(1)
+
+
+def handle_missing_values(df, fill_value="N/A"):
+    """Fill missing values: numeric columns get 0, others get fill_value."""
+    before = df.isnull().sum().sum()
+
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].fillna(0)
+        else:
+            df[col] = df[col].fillna(fill_value)
+
+    after = df.isnull().sum().sum()
+    logging.info(f"Missing values handled: {before} blanks filled ({before - after} fixed).")
+    return df
+
+
+def parse_date_columns(df, date_columns):
+    """Try to parse specified columns as dates."""
+    for col in date_columns:
+        if col not in df.columns:
+            logging.warning(f"Date column '{col}' not found in the file. Skipping.")
+            continue
+        try:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            bad_dates = df[col].isnull().sum()
+            if bad_dates > 0:
+                logging.warning(f"Column '{col}': {bad_dates} value(s) could not be parsed as dates and were set to NaT.")
+            else:
+                logging.info(f"Column '{col}' parsed as dates successfully.")
+        except Exception as e:
+            logging.warning(f"Could not parse column '{col}' as dates: {e}")
+    return df
+
+
+def rename_columns(df, rename_pairs):
+    """Rename columns using old=new string pairs."""
+    rename_map = {}
+    for pair in rename_pairs:
+        if "=" not in pair:
+            logging.warning(f"Skipping invalid rename pair (missing '='): '{pair}'")
+            continue
+        old, new = pair.split("=", 1)
+        if old not in df.columns:
+            logging.warning(f"Column '{old}' not found for renaming. Skipping.")
+        else:
+            rename_map[old] = new
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+        logging.info(f"Columns renamed: {rename_map}")
+    return df
+
+
+def normalize_text_columns(df):
+    """Strip whitespace and normalize casing for string columns."""
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].astype(str).str.strip()
+    logging.info("Text columns stripped of leading/trailing whitespace.")
+    return df
+
+
+# ─────────────────────────────────────────────
+#  EXPORT TO EXCEL
+# ─────────────────────────────────────────────
+
+def export_to_excel(df, output_path):
+    """Export the DataFrame to an Excel file with basic formatting."""
+    if not output_path.lower().endswith(".xlsx"):
+        output_path += ".xlsx"
+
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Cleaned Data")
+
+            # Auto-adjust column widths
+            worksheet = writer.sheets["Cleaned Data"]
+            for col_idx, col in enumerate(df.columns, start=1):
+                max_len = max(
+                    df[col].astype(str).map(len).max(),
+                    len(str(col))
+                ) + 2
+                worksheet.column_dimensions[
+                    worksheet.cell(row=1, column=col_idx).column_letter
+                ].width = min(max_len, 40)  # cap at 40
+
+        logging.info(f"Excel file saved to: '{output_path}'")
+    except Exception as e:
+        logging.error(f"Failed to write Excel file: {e}")
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    setup_logging()
+    args = parse_args()
+
+    logging.info("=== CSV to Excel Converter Started ===")
+
+    # Step 1: Read
+    df = read_csv(args.input)
+
+    # Step 2: Parse date columns
+    if args.date_columns:
+        df = parse_date_columns(df, args.date_columns)
+
+    # Step 3: Handle missing values
+    df = handle_missing_values(df, fill_value=args.fill_value)
+
+    # Step 4: Normalize text
+    df = normalize_text_columns(df)
+
+    # Step 5: Rename columns
+    if args.rename:
+        df = rename_columns(df, args.rename)
+
+    # Step 6: Export
+    export_to_excel(df, args.output)
+
+    logging.info("=== Conversion Complete! ===")
+
+
+if __name__ == "__main__":
+    main()
+
+///////////////////////////////////////////////////////////////
+Basic usage:
+bashpython csv_to_excel.py -i sample_data.csv -o result.xlsx
+
+With date parsing:
+bashpython csv_to_excel.py -i sample_data.csv -o result.xlsx --date-columns join_date
+
+With renaming + date parsing:
+bashpython csv_to_excel.py -i sample_data.csv -o result.xlsx \
+  --date-columns join_date \
+  --rename first_name=First last_name=Last email=Email
+
+Output:
+2025-06-21 [INFO] Logging started. Log file: logs/converter_....log
+2025-06-21 [INFO] === CSV to Excel Converter Started ===
+2025-06-21 [INFO] Successfully read 'sample_data.csv' — 5 rows, 5 columns.
+2025-06-21 [INFO] Column 'join_date' parsed as dates successfully.
+2025-06-21 [WARNING] Column 'join_date': 1 value(s) could not be parsed...
+2025-06-21 [INFO] Missing values handled: 4 blanks filled.
+2025-06-21 [INFO] Text columns stripped of whitespace.
+2025-06-21 [INFO] Excel file saved to: 'result.xlsx'
+2025-06-21 [INFO] === Conversion Complete! ===
+

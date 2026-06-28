@@ -1,0 +1,693 @@
+Syntecxhub_Expense_Tracker/
+├── expense_tracker.py   ← main script
+├── requirements.txt
+├── README.md
+├── expenses.db          ← SQLite DB (auto-created)
+├── tracker.log          ← log file  (auto-created)
+├── expenses_<ts>.csv    ← CSV export (on demand)
+├── expenses_<ts>.xlsx   ← Excel export (on demand)
+├── chart_monthly_<ts>.png     ← bar chart (on demand)
+└── chart_categories_<ts>.png  ← pie chart (on demand)
+
+How it work?
+User Input (CLI flags or interactive prompts)
+         │
+         ▼
+  add_entry() / delete_entry()
+         │
+         ▼
+    SQLite DB (expenses.db)
+         │
+    ┌────┴──────────────────────┐
+    ▼                           ▼
+list_entries()           monthly_summary()
+    │                           │
+    ├── export_csv()     print_summary()
+    ├── export_excel()
+    ├── export_chart_monthly()     (matplotlib → PNG)
+    └── export_chart_categories()  (matplotlib → PNG)
+
+
+Step-by-Step to Run It!
+
+Requirments: 
+openpyxl>=3.1.0
+matplotlib>=3.7.0   # optional — only needed for chart export
+
+
+Step 1 — Set up
+bashmkdir Syntecxhub_Expense_Tracker
+# drop expense_tracker.py + requirements.txt inside
+cd Syntecxhub_Expense_Tracker
+pip install -r requirements.txt
+
+Step 2 — Add entries
+bash# interactive (it will prompt you)
+python expense_tracker.py add expense
+
+# or one-liner
+python expense_tracker.py add income --date 2025-06-01 --category Salary --amount 3000 --note "June salary"
+python expense_tracker.py add expense --date 2025-06-05 --category Food --amount 150 --note "Groceries"
+
+Step 3 — View entries & summary
+bashpython expense_tracker.py list --month 2025-06
+python expense_tracker.py summary --month 2025-06
+python expense_tracker.py summary --all
+
+Step 4 — Export
+bashpython expense_tracker.py export --format excel --month 2025-06
+python expense_tracker.py export --format csv
+
+Step 5 — Charts
+bashpython expense_tracker.py chart --type monthly
+python expense_tracker.py chart --type categories --month 2025-06
+
+//////////////////////////////////////////////////////
+expense_tracker.py
+////////////////////////////////
+
+import argparse
+import csv
+import json
+import logging
+import os
+import sqlite3
+import sys
+from datetime import datetime, date
+from pathlib import Path
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import BarChart, PieChart, Reference
+except ImportError:
+    sys.exit("Missing 'openpyxl'. Run: pip install -r requirements.txt")
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")          # non-interactive backend — no GUI needed
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+# ─── Paths & constants ────────────────────────────────────────────────────────
+
+BASE_DIR  = Path(__file__).parent
+DB_PATH   = BASE_DIR / "expenses.db"
+LOG_PATH  = BASE_DIR / "tracker.log"
+
+CATEGORIES = [
+    "Food", "Transport", "Housing", "Utilities", "Entertainment",
+    "Healthcare", "Education", "Shopping", "Salary", "Freelance",
+    "Investment", "Other",
+]
+
+INCOME_CATS  = {"Salary", "Freelance", "Investment"}
+EXPENSE_CATS = set(CATEGORIES) - INCOME_CATS
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS entries (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            type       TEXT NOT NULL CHECK(type IN ('income','expense')),
+            date       TEXT NOT NULL,              -- YYYY-MM-DD
+            category   TEXT NOT NULL,
+            amount     REAL NOT NULL CHECK(amount > 0),
+            note       TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def add_entry(conn, entry_type: str, entry_date: str, category: str,
+              amount: float, note: str) -> int:
+    cur = conn.execute(
+        """INSERT INTO entries (type, date, category, amount, note, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (entry_type, entry_date, category, amount, note,
+         datetime.now().isoformat()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def delete_entry(conn, entry_id: int) -> bool:
+    cur = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def list_entries(conn, month: str = "", entry_type: str = "",
+                 category: str = "") -> list:
+    sql  = "SELECT * FROM entries WHERE 1=1"
+    args = []
+    if month:                              # expects YYYY-MM
+        sql += " AND date LIKE ?"
+        args.append(f"{month}%")
+    if entry_type:
+        sql += " AND type = ?"
+        args.append(entry_type)
+    if category:
+        sql += " AND LOWER(category) = ?"
+        args.append(category.lower())
+    sql += " ORDER BY date DESC, id DESC"
+    return conn.execute(sql, args).fetchall()
+
+# ─── Summary helpers ──────────────────────────────────────────────────────────
+
+def monthly_summary(conn, month: str) -> dict:
+    """Return a dict with totals and per-category breakdown for a YYYY-MM."""
+    rows = list_entries(conn, month=month)
+    income = expense = 0.0
+    by_cat: dict[str, float] = {}
+    for r in rows:
+        if r["type"] == "income":
+            income += r["amount"]
+        else:
+            expense += r["amount"]
+        by_cat[r["category"]] = by_cat.get(r["category"], 0.0) + r["amount"]
+    return {
+        "month":   month,
+        "income":  income,
+        "expense": expense,
+        "net":     income - expense,
+        "by_cat":  by_cat,
+        "entries": rows,
+    }
+
+
+def all_monthly_totals(conn) -> list[dict]:
+    """Return one summary dict per month that has data."""
+    rows = conn.execute(
+        "SELECT SUBSTR(date,1,7) m FROM entries GROUP BY m ORDER BY m"
+    ).fetchall()
+    return [monthly_summary(conn, r["m"]) for r in rows]
+
+# ─── Display helpers ──────────────────────────────────────────────────────────
+
+CURRENCY = "$"
+
+
+def fmt(amount: float) -> str:
+    return f"{CURRENCY}{amount:,.2f}"
+
+
+def print_entries(rows, title: str = "Entries") -> None:
+    if not rows:
+        print("  No entries found.\n")
+        return
+    w = 80
+    print(f"\n{'─'*w}")
+    print(f"  {title}")
+    print(f"{'─'*w}")
+    print(f"  {'ID':>4}  {'Date':<12}  {'Type':<8}  {'Category':<14}  {'Amount':>10}  Note")
+    print(f"{'─'*w}")
+    for r in rows:
+        sign   = "+" if r["type"] == "income" else "-"
+        color  = "\033[32m" if r["type"] == "income" else "\033[31m"
+        reset  = "\033[0m"
+        amount = f"{color}{sign}{fmt(r['amount'])}{reset}"
+        print(f"  {r['id']:>4}  {r['date']:<12}  {r['type']:<8}  "
+              f"{r['category']:<14}  {amount:>10}  {r['note']}")
+    print(f"{'─'*w}\n")
+
+
+def print_summary(s: dict) -> None:
+    net_color = "\033[32m" if s["net"] >= 0 else "\033[31m"
+    reset     = "\033[0m"
+    print(f"""
+╔══════════════════════════════════════╗
+║   Monthly Summary: {s['month']:<18} ║
+╠══════════════════════════════════════╣
+║  Total Income  : {fmt(s['income']):>20} ║
+║  Total Expense : {fmt(s['expense']):>20} ║
+║  Net Balance   : {net_color}{fmt(s['net']):>20}{reset} ║
+╠══════════════════════════════════════╣
+║  Category Breakdown                  ║""")
+    for cat, amt in sorted(s["by_cat"].items(), key=lambda x: -x[1]):
+        line = f"{cat:<16} {fmt(amt):>10}"
+        print(f"║    {line:<36} ║")
+    print("╚══════════════════════════════════════╝\n")
+
+# ─── Export ───────────────────────────────────────────────────────────────────
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def export_csv(rows, path: str = "") -> str:
+    out = path or str(BASE_DIR / f"expenses_{_ts()}.csv")
+    cols = ["id", "type", "date", "category", "amount", "note", "created_at"]
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r[c] for c in cols})
+    return out
+
+
+def export_excel(conn, month: str = "", path: str = "") -> str:
+    """Create a rich Excel workbook with a data sheet + summary sheet."""
+    out = path or str(BASE_DIR / f"expenses_{_ts()}.xlsx")
+    rows = list_entries(conn, month=month)
+
+    wb = openpyxl.Workbook()
+
+    # ── Sheet 1: Raw Data ──────────────────────────────────────────────────
+    ws_data = wb.active
+    ws_data.title = "Entries"
+    cols = ["ID", "Type", "Date", "Category", "Amount", "Note", "Created At"]
+    ws_data.append(cols)
+
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    thin_border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
+    )
+    for cell in ws_data[1]:
+        cell.font      = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill      = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        cell.border    = thin_border
+
+    income_fill  = PatternFill("solid", fgColor="C6EFCE")
+    expense_fill = PatternFill("solid", fgColor="FFC7CE")
+    for r in rows:
+        ws_data.append([r["id"], r["type"], r["date"], r["category"],
+                        r["amount"], r["note"], r["created_at"]])
+        row_fill = income_fill if r["type"] == "income" else expense_fill
+        for cell in ws_data[ws_data.max_row]:
+            cell.fill   = row_fill
+            cell.border = thin_border
+
+    # Auto-width
+    for col in ws_data.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+        ws_data.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    # ── Sheet 2: Monthly Summary ───────────────────────────────────────────
+    ws_sum = wb.create_sheet("Monthly Summary")
+    summaries = all_monthly_totals(conn)
+
+    sum_headers = ["Month", "Income", "Expense", "Net Balance"]
+    ws_sum.append(sum_headers)
+    for cell in ws_sum[1]:
+        cell.font      = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill      = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        cell.border    = thin_border
+
+    for s in summaries:
+        ws_sum.append([s["month"], s["income"], s["expense"], s["net"]])
+        for cell in ws_sum[ws_sum.max_row]:
+            cell.border    = thin_border
+            cell.alignment = Alignment(horizontal="right")
+        # colour net balance cell
+        net_cell = ws_sum.cell(ws_sum.max_row, 4)
+        net_cell.fill = PatternFill("solid",
+                                    fgColor="C6EFCE" if s["net"] >= 0 else "FFC7CE")
+        net_cell.font = Font(bold=True)
+
+    for col in ws_sum.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+        ws_sum.column_dimensions[col[0].column_letter].width = min(max_len + 4, 25)
+
+    # ── Bar chart on summary sheet ─────────────────────────────────────────
+    if len(summaries) >= 1:
+        chart = BarChart()
+        chart.type    = "col"
+        chart.title   = "Income vs Expense by Month"
+        chart.y_axis.title = "Amount ($)"
+        chart.x_axis.title = "Month"
+        chart.width   = 20
+        chart.height  = 12
+
+        data_ref = Reference(ws_sum,
+                             min_col=2, max_col=3,
+                             min_row=1, max_row=ws_sum.max_row)
+        cats_ref = Reference(ws_sum, min_col=1,
+                             min_row=2, max_row=ws_sum.max_row)
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        ws_sum.add_chart(chart, "F2")
+
+    wb.save(out)
+    return out
+
+# ─── Chart export (matplotlib) ────────────────────────────────────────────────
+
+def export_chart_monthly(conn, path: str = "") -> str:
+    if not HAS_MATPLOTLIB:
+        return ""
+    summaries = all_monthly_totals(conn)
+    if not summaries:
+        return ""
+
+    months   = [s["month"] for s in summaries]
+    incomes  = [s["income"]  for s in summaries]
+    expenses = [s["expense"] for s in summaries]
+
+    x = range(len(months))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(8, len(months)*1.2), 5))
+    bars_i = ax.bar([i - w/2 for i in x], incomes,  w,
+                    label="Income",  color="#4CAF50", alpha=0.85)
+    bars_e = ax.bar([i + w/2 for i in x], expenses, w,
+                    label="Expense", color="#F44336", alpha=0.85)
+
+    ax.set_title("Monthly Income vs Expense", fontsize=14, fontweight="bold", pad=15)
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Amount ($)")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(months, rotation=30, ha="right")
+    ax.legend()
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.bar_label(bars_i, fmt="$%.0f", padding=3, fontsize=7)
+    ax.bar_label(bars_e, fmt="$%.0f", padding=3, fontsize=7)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+
+    out = path or str(BASE_DIR / f"chart_monthly_{_ts()}.png")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+
+def export_chart_categories(conn, month: str = "", path: str = "") -> str:
+    if not HAS_MATPLOTLIB:
+        return ""
+    s = monthly_summary(conn, month) if month else None
+
+    if s is None:
+        # aggregate all time
+        rows = list_entries(conn, entry_type="expense")
+        by_cat: dict[str, float] = {}
+        for r in rows:
+            by_cat[r["category"]] = by_cat.get(r["category"], 0.0) + r["amount"]
+        title = "All-Time Expenses by Category"
+    else:
+        by_cat = {k: v for k, v in s["by_cat"].items()
+                  if k not in INCOME_CATS}
+        title = f"Expenses by Category — {month}"
+
+    if not by_cat:
+        return ""
+
+    labels = list(by_cat.keys())
+    values = [by_cat[l] for l in labels]
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    wedges, texts, autotexts = ax.pie(
+        values, labels=labels, autopct="%1.1f%%",
+        startangle=140, pctdistance=0.82,
+        wedgeprops=dict(width=0.55, edgecolor="white"),
+    )
+    for t in autotexts:
+        t.set_fontsize(8)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=20)
+    fig.tight_layout()
+
+    out = path or str(BASE_DIR / f"chart_categories_{_ts()}.png")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+# ─── Interactive add (guided prompt) ─────────────────────────────────────────
+
+def interactive_add(conn, entry_type: str) -> None:
+    print(f"\n── Add {entry_type.upper()} ──────────────────────────")
+
+    # Date
+    today = date.today().isoformat()
+    raw   = input(f"  Date [{today}]: ").strip()
+    if not raw:
+        raw = today
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        print("  Invalid date format. Use YYYY-MM-DD.")
+        return
+
+    # Category
+    pool = sorted(INCOME_CATS if entry_type == "income" else EXPENSE_CATS)
+    print("  Categories:")
+    for i, c in enumerate(pool, 1):
+        print(f"    {i:>2}) {c}")
+    raw_cat = input("  Choose number or type name: ").strip()
+    if raw_cat.isdigit() and 1 <= int(raw_cat) <= len(pool):
+        category = pool[int(raw_cat) - 1]
+    elif raw_cat.capitalize() in CATEGORIES:
+        category = raw_cat.capitalize()
+    else:
+        print("  Unknown category.")
+        return
+
+    # Amount
+    raw_amt = input("  Amount: ").strip().lstrip("$").replace(",", "")
+    try:
+        amount = float(raw_amt)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        print("  Invalid amount.")
+        return
+
+    note = input("  Note (optional): ").strip()
+
+    entry_id = add_entry(conn, entry_type, raw, category, amount, note)
+    print(f"\n  ✅  Saved as entry #{entry_id}\n")
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="expense_tracker",
+        description="💰  Expense Tracker CLI — Syntecxhub Internship Task 4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES
+  # Add an expense interactively
+  python expense_tracker.py add expense
+
+  # Add income from command line (no prompts)
+  python expense_tracker.py add income --date 2025-06-01 --category Salary --amount 3000 --note "June salary"
+
+  # List all entries for June 2025
+  python expense_tracker.py list --month 2025-06
+
+  # Monthly summary
+  python expense_tracker.py summary --month 2025-06
+
+  # Export current month to Excel
+  python expense_tracker.py export --format excel --month 2025-06
+
+  # Export all entries to CSV
+  python expense_tracker.py export --format csv
+
+  # Generate charts (requires matplotlib)
+  python expense_tracker.py chart --type monthly
+  python expense_tracker.py chart --type categories --month 2025-06
+
+  # Delete an entry
+  python expense_tracker.py delete --id 5
+        """,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # ── add ──
+    a = sub.add_parser("add", help="Add an income or expense entry")
+    a.add_argument("type", choices=["income", "expense"])
+    a.add_argument("--date",     default="", metavar="YYYY-MM-DD",
+                   help="Entry date (default: today)")
+    a.add_argument("--category", default="",
+                   help=f"Category. Choices: {', '.join(CATEGORIES)}")
+    a.add_argument("--amount",   type=float, default=0,
+                   help="Amount (positive number)")
+    a.add_argument("--note",     default="", help="Optional note")
+
+    # ── list ──
+    l = sub.add_parser("list", help="List stored entries")
+    l.add_argument("--month",    default="", metavar="YYYY-MM")
+    l.add_argument("--type",     dest="entry_type", choices=["income","expense"], default="")
+    l.add_argument("--category", default="")
+
+    # ── summary ──
+    s = sub.add_parser("summary", help="Show monthly financial summary")
+    s.add_argument("--month", default="",
+                   metavar="YYYY-MM", help="Month to summarise (default: current month)")
+    s.add_argument("--all", dest="all_months", action="store_true",
+                   help="Show summary for every month in the DB")
+
+    # ── export ──
+    e = sub.add_parser("export", help="Export entries to CSV or Excel")
+    e.add_argument("--format", choices=["csv","excel"], default="csv")
+    e.add_argument("--month",  default="", metavar="YYYY-MM",
+                   help="Filter by month before export")
+    e.add_argument("--output", default="", help="Output file path (auto-generated if omitted)")
+
+    # ── chart ──
+    c = sub.add_parser("chart", help="Export a chart image (requires matplotlib)")
+    c.add_argument("--type",  choices=["monthly","categories"], default="monthly")
+    c.add_argument("--month", default="", metavar="YYYY-MM",
+                   help="Used with --type categories to filter one month")
+    c.add_argument("--output", default="")
+
+    # ── delete ──
+    d = sub.add_parser("delete", help="Delete an entry by ID")
+    d.add_argument("--id", type=int, required=True, help="Entry ID to delete")
+
+    # ── stats ──
+    sub.add_parser("stats", help="Show overall DB statistics")
+
+    return p
+
+
+def cmd_add(args, conn):
+    # If key flags omitted → go interactive
+    if not args.amount:
+        interactive_add(conn, args.type)
+        return
+
+    entry_date = args.date or date.today().isoformat()
+    try:
+        datetime.strptime(entry_date, "%Y-%m-%d")
+    except ValueError:
+        print("Invalid date. Use YYYY-MM-DD.")
+        return
+
+    if not args.category:
+        print("--category is required in non-interactive mode.")
+        return
+    if args.category not in CATEGORIES:
+        print(f"Unknown category. Choose from: {', '.join(CATEGORIES)}")
+        return
+
+    entry_id = add_entry(conn, args.type, entry_date,
+                         args.category, args.amount, args.note)
+    print(f"\n  ✅  {args.type.capitalize()} of {fmt(args.amount)} "
+          f"({args.category}) saved as entry #{entry_id}\n")
+
+
+def cmd_list(args, conn):
+    rows = list_entries(conn, args.month, args.entry_type, args.category)
+    label = "All Entries"
+    if args.month:      label += f" — {args.month}"
+    if args.entry_type: label += f" [{args.entry_type}]"
+    print_entries(rows, label)
+    inc  = sum(r["amount"] for r in rows if r["type"] == "income")
+    exp  = sum(r["amount"] for r in rows if r["type"] == "expense")
+    print(f"  {len(rows)} entries  |  Income: {fmt(inc)}  |  Expense: {fmt(exp)}  |  Net: {fmt(inc-exp)}\n")
+
+
+def cmd_summary(args, conn):
+    if args.all_months:
+        for s in all_monthly_totals(conn):
+            print_summary(s)
+    else:
+        month = args.month or date.today().strftime("%Y-%m")
+        print_summary(monthly_summary(conn, month))
+
+
+def cmd_export(args, conn):
+    if args.format == "csv":
+        rows = list_entries(conn, month=args.month)
+        if not rows:
+            print("No entries to export.")
+            return
+        out = export_csv(rows, args.output)
+    else:
+        out = export_excel(conn, month=args.month, path=args.output)
+    print(f"\n  ✅  Exported → {out}\n")
+
+
+def cmd_chart(args, conn):
+    if not HAS_MATPLOTLIB:
+        print("matplotlib is not installed. Run: pip install matplotlib")
+        return
+    if args.type == "monthly":
+        out = export_chart_monthly(conn, args.output)
+    else:
+        out = export_chart_categories(conn, args.month, args.output)
+
+    if out:
+        print(f"\n  ✅  Chart saved → {out}\n")
+    else:
+        print("  Not enough data to generate chart.")
+
+
+def cmd_delete(args, conn):
+    if delete_entry(conn, args.id):
+        print(f"\n  ✅  Entry #{args.id} deleted.\n")
+    else:
+        print(f"\n  Entry #{args.id} not found.\n")
+
+
+def cmd_stats(conn):
+    total   = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    inc_sum = conn.execute("SELECT COALESCE(SUM(amount),0) FROM entries WHERE type='income'").fetchone()[0]
+    exp_sum = conn.execute("SELECT COALESCE(SUM(amount),0) FROM entries WHERE type='expense'").fetchone()[0]
+    months  = conn.execute(
+        "SELECT COUNT(DISTINCT SUBSTR(date,1,7)) FROM entries").fetchone()[0]
+    top_cat = conn.execute(
+        "SELECT category, SUM(amount) s FROM entries WHERE type='expense' "
+        "GROUP BY category ORDER BY s DESC LIMIT 1"
+    ).fetchone()
+
+    print(f"""
+╔══════════════════════════════════════╗
+║        EXPENSE TRACKER STATS         ║
+╠══════════════════════════════════════╣
+║  Total entries   : {total:<18} ║
+║  Months tracked  : {months:<18} ║
+║  All-time income : {fmt(inc_sum):>18} ║
+║  All-time expense: {fmt(exp_sum):>18} ║
+║  Net balance     : {fmt(inc_sum - exp_sum):>18} ║
+║  Top expense cat : {(top_cat['category'] if top_cat else 'N/A'):<18} ║
+╚══════════════════════════════════════╝
+    """)
+
+
+def main():
+    parser = build_parser()
+    args   = parser.parse_args()
+    conn   = init_db()
+
+    try:
+        dispatch = {
+            "add":     lambda: cmd_add(args, conn),
+            "list":    lambda: cmd_list(args, conn),
+            "summary": lambda: cmd_summary(args, conn),
+            "export":  lambda: cmd_export(args, conn),
+            "chart":   lambda: cmd_chart(args, conn),
+            "delete":  lambda: cmd_delete(args, conn),
+            "stats":   lambda: cmd_stats(conn),
+        }
+        dispatch[args.command]()
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

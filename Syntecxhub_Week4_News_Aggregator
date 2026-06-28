@@ -1,0 +1,546 @@
+Syntecxhub_News_Aggregator/
+├── news_aggregator.py   ← main script
+├── requirements.txt
+├── README.md
+├── news.db              ← SQLite DB (auto-created on first run)
+├── news_cache.json      ← raw API cache (auto-created on fetch)
+└── aggregator.log       ← log file (auto-created on first run)
+
+Requirments: 
+requests>=2.31.0
+openpyxl>=3.1.0
+
+How it works:
+NewsAPI (top-headlines / everything)
+         │
+         ▼
+  fetch_top_headlines()
+  fetch_everything()
+         │
+         ▼
+  insert_articles()  ── MD5 dedup check ──► skip if duplicate
+         │
+         ▼
+    SQLite DB (news.db)
+         │
+    ┌────┴───────────────┐
+    ▼                    ▼
+ search/filter        export
+(query_articles)   CSV / Excel / JSON
+
+
+////////////////////////////////////////////////////////
+news_aggregator.py
+//////////////////////////////////////////////////////////
+"""
+News Aggregator CLI — Syntecxhub Internship Task 4, Project 1
+Fetches headlines via NewsAPI, stores in SQLite/JSON, exports to CSV/Excel.
+Usage: python news_aggregator.py --help
+"""
+
+import argparse
+import json
+import sqlite3
+import csv
+import os
+import sys
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Third-party (install via requirements.txt)
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing 'requests'. Run: pip install -r requirements.txt")
+
+try:
+    import openpyxl
+except ImportError:
+    sys.exit("Missing 'openpyxl'. Run: pip install -r requirements.txt")
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+BASE_DIR   = Path(__file__).parent
+DB_PATH    = BASE_DIR / "news.db"
+JSON_PATH  = BASE_DIR / "news_cache.json"
+LOG_PATH   = BASE_DIR / "aggregator.log"
+NEWSAPI_URL = "https://newsapi.org/v2/everything"
+NEWSAPI_TOP = "https://newsapi.org/v2/top-headlines"
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+
+def init_db() -> sqlite3.Connection:
+    """Create the articles table if it doesn't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            hash        TEXT UNIQUE,          -- deduplication key
+            source      TEXT,
+            author      TEXT,
+            title       TEXT,
+            description TEXT,
+            url         TEXT,
+            published   TEXT,
+            fetched_at  TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def article_hash(title: str, url: str) -> str:
+    """Generate a short dedup hash from title + url."""
+    raw = f"{title}{url}".encode("utf-8")
+    return hashlib.md5(raw).hexdigest()
+
+
+def insert_articles(conn: sqlite3.Connection, articles: list[dict]) -> int:
+    """Insert new articles; skip duplicates. Returns count of inserted rows."""
+    inserted = 0
+    for a in articles:
+        h = article_hash(a.get("title", ""), a.get("url", ""))
+        try:
+            conn.execute(
+                """INSERT INTO articles
+                   (hash, source, author, title, description, url, published, fetched_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    h,
+                    a.get("source", {}).get("name", "Unknown"),
+                    a.get("author", ""),
+                    a.get("title", ""),
+                    a.get("description", ""),
+                    a.get("url", ""),
+                    a.get("publishedAt", ""),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            inserted += 1
+        except sqlite3.IntegrityError:
+            pass  # duplicate — skip silently
+    conn.commit()
+    return inserted
+
+# ─── NewsAPI Fetcher ───────────────────────────────────────────────────────────
+
+def fetch_top_headlines(api_key: str, sources: str = "", keyword: str = "",
+                        page_size: int = 50) -> list[dict]:
+    """Fetch top headlines from NewsAPI."""
+    params = {
+        "apiKey":   api_key,
+        "pageSize": page_size,
+        "language": "en",
+    }
+    if sources:
+        params["sources"] = sources
+    if keyword:
+        params["q"] = keyword
+
+    log.info(f"Fetching top headlines  keyword={keyword!r}  sources={sources!r}")
+    resp = requests.get(NEWSAPI_TOP, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        log.error(f"NewsAPI error: {data.get('message')}")
+        return []
+    return data.get("articles", [])
+
+
+def fetch_everything(api_key: str, keyword: str = "", sources: str = "",
+                     from_date: str = "", to_date: str = "",
+                     page_size: int = 50) -> list[dict]:
+    """Fetch articles from the /everything endpoint with full filters."""
+    if not keyword and not sources:
+        # NewsAPI requires at least q or sources for /everything
+        keyword = "technology"
+
+    params = {
+        "apiKey":   api_key,
+        "pageSize": page_size,
+        "language": "en",
+        "sortBy":   "publishedAt",
+    }
+    if keyword:
+        params["q"] = keyword
+    if sources:
+        params["sources"] = sources
+    if from_date:
+        params["from"] = from_date
+    if to_date:
+        params["to"] = to_date
+
+    log.info(f"Fetching /everything  keyword={keyword!r}  sources={sources!r}  "
+             f"from={from_date}  to={to_date}")
+    resp = requests.get(NEWSAPI_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        log.error(f"NewsAPI error: {data.get('message')}")
+        return []
+    return data.get("articles", [])
+
+# ─── Query / Filter ───────────────────────────────────────────────────────────
+
+def query_articles(conn: sqlite3.Connection, source: str = "",
+                   keyword: str = "", date: str = "") -> list[sqlite3.Row]:
+    """Filter stored articles by source, keyword, or date (YYYY-MM-DD)."""
+    sql  = "SELECT * FROM articles WHERE 1=1"
+    args = []
+
+    if source:
+        sql += " AND LOWER(source) LIKE ?"
+        args.append(f"%{source.lower()}%")
+    if keyword:
+        sql += " AND (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)"
+        kw = f"%{keyword.lower()}%"
+        args.extend([kw, kw])
+    if date:
+        sql += " AND published LIKE ?"
+        args.append(f"{date}%")
+
+    sql += " ORDER BY published DESC"
+    return conn.execute(sql, args).fetchall()
+
+# ─── Export ───────────────────────────────────────────────────────────────────
+
+COLUMNS = ["id", "source", "author", "title", "description", "url", "published", "fetched_at"]
+
+
+def export_json(rows: list[sqlite3.Row], path: str = "") -> str:
+    out = path or str(BASE_DIR / f"export_{_ts()}.json")
+    data = [dict(zip(COLUMNS, (r["id"], r["source"], r["author"],
+                               r["title"], r["description"],
+                               r["url"], r["published"], r["fetched_at"])))
+            for r in rows]
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    log.info(f"Exported {len(data)} articles → {out}")
+    return out
+
+
+def export_csv(rows: list[sqlite3.Row], path: str = "") -> str:
+    out = path or str(BASE_DIR / f"export_{_ts()}.csv")
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({c: r[c] for c in COLUMNS})
+    log.info(f"Exported {len(rows)} articles → {out}")
+    return out
+
+
+def export_excel(rows: list[sqlite3.Row], path: str = "") -> str:
+    out = path or str(BASE_DIR / f"export_{_ts()}.xlsx")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "News"
+
+    # Header row with bold styling
+    ws.append(COLUMNS)
+    from openpyxl.styles import Font, PatternFill, Alignment
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    for cell in ws[1]:
+        cell.font      = Font(bold=True, color="FFFFFF")
+        cell.fill      = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # Data rows
+    for r in rows:
+        ws.append([r[c] for c in COLUMNS])
+
+    # Auto-width
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    wb.save(out)
+    log.info(f"Exported {len(rows)} articles → {out}")
+    return out
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def print_articles(rows: list[sqlite3.Row], limit: int = 20) -> None:
+    """Pretty-print articles to the terminal."""
+    if not rows:
+        print("\n  No articles found.\n")
+        return
+    print(f"\n{'─'*80}")
+    for i, r in enumerate(rows[:limit], 1):
+        pub = r["published"][:10] if r["published"] else "N/A"
+        print(f"[{i:>3}] [{pub}] {r['source']}")
+        print(f"       {r['title']}")
+        print(f"       {r['url']}")
+        print()
+    if len(rows) > limit:
+        print(f"  ... and {len(rows)-limit} more. Use --export to see all.\n")
+    print(f"{'─'*80}\n")
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="news_aggregator",
+        description="📰  News Aggregator CLI — Syntecxhub Internship Task 4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES
+  # Fetch top headlines and store them
+  python news_aggregator.py fetch --api-key YOUR_KEY
+
+  # Fetch articles about AI from BBC
+  python news_aggregator.py fetch --api-key YOUR_KEY --keyword "AI" --sources "bbc-news"
+
+  # Fetch articles from a specific date range
+  python news_aggregator.py fetch --api-key YOUR_KEY --keyword "climate" --from 2025-06-01 --to 2025-06-30
+
+  # Search stored articles
+  python news_aggregator.py search --keyword "python" --source "techcrunch"
+
+  # Export stored articles
+  python news_aggregator.py export --format excel --keyword "bitcoin"
+        """,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # ── fetch ──
+    f = sub.add_parser("fetch", help="Fetch fresh articles from NewsAPI")
+    f.add_argument("--api-key",  required=True, help="Your NewsAPI key (newsapi.org)")
+    f.add_argument("--keyword",  default="",    help="Search keyword / phrase")
+    f.add_argument("--sources",  default="",    help="Comma-separated source IDs e.g. bbc-news,cnn")
+    f.add_argument("--from",     dest="from_date", default="", metavar="YYYY-MM-DD",
+                   help="Start date (only for /everything)")
+    f.add_argument("--to",       dest="to_date",   default="", metavar="YYYY-MM-DD",
+                   help="End date   (only for /everything)")
+    f.add_argument("--top",      action="store_true",
+                   help="Use /top-headlines instead of /everything")
+    f.add_argument("--page-size", type=int, default=50, metavar="N",
+                   help="Max articles to fetch (default 50, max 100)")
+
+    # ── search ──
+    s = sub.add_parser("search", help="Search articles already stored in the DB")
+    s.add_argument("--keyword", default="", help="Filter by keyword in title/description")
+    s.add_argument("--source",  default="", help="Filter by source name (partial match)")
+    s.add_argument("--date",    default="", metavar="YYYY-MM-DD", help="Filter by publish date")
+    s.add_argument("--limit",   type=int, default=20, help="Max rows to print (default 20)")
+
+    # ── export ──
+    e = sub.add_parser("export", help="Export stored articles to CSV / Excel / JSON")
+    e.add_argument("--format",  choices=["csv", "excel", "json"], default="csv",
+                   help="Output format (default: csv)")
+    e.add_argument("--keyword", default="", help="Filter by keyword before exporting")
+    e.add_argument("--source",  default="", help="Filter by source before exporting")
+    e.add_argument("--date",    default="", metavar="YYYY-MM-DD",
+                   help="Filter by publish date before exporting")
+    e.add_argument("--output",  default="", help="Output file path (auto-generated if omitted)")
+
+    # ── stats ──
+    sub.add_parser("stats", help="Show database statistics")
+
+    return p
+
+
+def cmd_fetch(args, conn):
+    if args.top:
+        articles = fetch_top_headlines(args.api_key, args.sources,
+                                       args.keyword, args.page_size)
+    else:
+        articles = fetch_everything(args.api_key, args.keyword, args.sources,
+                                    args.from_date, args.to_date, args.page_size)
+
+    if not articles:
+        log.warning("No articles returned from NewsAPI.")
+        return
+
+    inserted = insert_articles(conn, articles)
+    log.info(f"Fetched {len(articles)} articles — {inserted} new, "
+             f"{len(articles)-inserted} duplicates skipped.")
+
+    # Also cache raw JSON
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(articles, f, indent=2, ensure_ascii=False)
+    log.info(f"Raw cache saved → {JSON_PATH}")
+
+
+def cmd_search(args, conn):
+    rows = query_articles(conn, args.source, args.keyword, args.date)
+    print_articles(rows, args.limit)
+    print(f"  Total matching: {len(rows)}")
+
+
+def cmd_export(args, conn):
+    rows = query_articles(conn, args.source, args.keyword, args.date)
+    if not rows:
+        print("No articles match the given filters — nothing to export.")
+        return
+    if args.format == "csv":
+        out = export_csv(rows, args.output)
+    elif args.format == "excel":
+        out = export_excel(rows, args.output)
+    else:
+        out = export_json(rows, args.output)
+    print(f"\n✅  Exported {len(rows)} articles → {out}\n")
+
+
+def cmd_stats(conn):
+    total    = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+    sources  = conn.execute("SELECT COUNT(DISTINCT source) FROM articles").fetchone()[0]
+    oldest   = conn.execute("SELECT MIN(published) FROM articles").fetchone()[0]
+    newest   = conn.execute("SELECT MAX(published) FROM articles").fetchone()[0]
+    top_srcs = conn.execute(
+        "SELECT source, COUNT(*) c FROM articles GROUP BY source ORDER BY c DESC LIMIT 5"
+    ).fetchall()
+
+    print(f"""
+╔══════════════════════════════════╗
+║       NEWS AGGREGATOR STATS      ║
+╠══════════════════════════════════╣
+║ Total articles : {total:<16} ║
+║ Unique sources : {sources:<16} ║
+║ Oldest article : {(oldest or 'N/A')[:10]:<16} ║
+║ Newest article : {(newest or 'N/A')[:10]:<16} ║
+╠══════════════════════════════════╣
+║ Top 5 Sources                    ║""")
+    for row in top_srcs:
+        line = f"{row['source'][:22]} ({row['c']})"
+        print(f"║  {line:<32} ║")
+    print("╚══════════════════════════════════╝\n")
+
+
+def main():
+    parser = build_parser()
+    args   = parser.parse_args()
+    conn   = init_db()
+
+    try:
+        if args.command == "fetch":
+            cmd_fetch(args, conn)
+        elif args.command == "search":
+            cmd_search(args, conn)
+        elif args.command == "export":
+            cmd_export(args, conn)
+        elif args.command == "stats":
+            cmd_stats(conn)
+    except requests.exceptions.HTTPError as e:
+        log.error(f"HTTP error: {e}")
+        sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        log.error("Network error — check your internet connection.")
+        sys.exit(1)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+/////////////////////////////////////////////////////////////////////////
+
+# 📰 News Aggregator CLI
+**Syntecxhub Internship — Python Programming Task 4 / Project 1**
+
+---
+
+## Features
+| Feature | Details |
+|---|---|
+| **Data sources** | NewsAPI `/top-headlines` & `/everything` |
+| **CLI filters** | `--keyword`, `--source`, `--date`, `--from`, `--to` |
+| **Storage** | SQLite database + raw JSON cache |
+| **Export** | CSV, Excel (.xlsx), JSON |
+| **Deduplication** | MD5 hash of `title + url` — no duplicate rows |
+| **Logging** | Console + `aggregator.log` file |
+
+---
+
+## Setup
+
+### 1. Get a free NewsAPI key
+Go to → [https://newsapi.org/register](https://newsapi.org/register)  
+Copy your API key.
+
+### 2. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Run it
+```bash
+python news_aggregator.py --help
+```
+
+---
+
+## Usage Examples
+
+### Fetch top headlines
+```bash
+python news_aggregator.py fetch --api-key YOUR_KEY --top
+```
+
+### Fetch articles about AI
+```bash
+python news_aggregator.py fetch --api-key YOUR_KEY --keyword "artificial intelligence"
+```
+
+### Fetch from specific sources
+```bash
+python news_aggregator.py fetch --api-key YOUR_KEY --sources "bbc-news,cnn,techcrunch"
+```
+
+### Fetch with date range
+```bash
+python news_aggregator.py fetch --api-key YOUR_KEY --keyword "climate" --from 2025-06-01 --to 2025-06-28
+```
+
+### Search stored articles
+```bash
+# by keyword
+python news_aggregator.py search --keyword "bitcoin"
+
+# by source
+python news_aggregator.py search --source "bbc"
+
+# by date
+python news_aggregator.py search --date 2025-06-28
+
+# combine filters
+python news_aggregator.py search --keyword "AI" --source "techcrunch" --limit 10
+```
+
+### Export to Excel
+```bash
+python news_aggregator.py export --format excel
+```
+
+### Export filtered results to CSV
+```bash
+python news_aggregator.py export --format csv --keyword "bitcoin" --output bitcoin_news.csv
+```
+
+### View database statistics
+```bash
+python news_aggregator.py stats
+```
+## Notes
+- The free NewsAPI plan returns up to 100 articles per request and allows articles from the past month.
+- `--sources` must use NewsAPI source IDs (e.g. `bbc-news`, not `BBC News`). Find IDs at https://newsapi.org/docs/endpoints/sources
